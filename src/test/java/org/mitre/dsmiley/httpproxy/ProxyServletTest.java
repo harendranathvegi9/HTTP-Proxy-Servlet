@@ -35,6 +35,8 @@ import java.io.PrintWriter;
 import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.Dictionary;
+import java.util.Enumeration;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -124,26 +126,39 @@ public class ProxyServletTest
 
   @Test
   public void testRedirect() throws IOException, SAXException {
+    final String COOKIE_SET_HEADER = "Set-Cookie";
     localTestServer.register("/targetPath*",new HttpRequestHandler()
     {
       public void handle(HttpRequest request, HttpResponse response, HttpContext context) throws HttpException, IOException {
         response.setHeader(HttpHeaders.LOCATION,request.getFirstHeader("xxTarget").getValue());
+        response.setHeader(COOKIE_SET_HEADER,"JSESSIONID=1234; path=/;");
         response.setStatusCode(HttpStatus.SC_MOVED_TEMPORARILY);
       }
     });//matches /targetPath and /targetPath/blahblah
-    GetMethodWebRequest request = makeGetMethodRequest(sourceBaseUri);
+    GetMethodWebRequest request = makeGetMethodRequest(sourceBaseUri + "/%64%69%72%2F");
     assertRedirect(request, "/dummy", "/dummy");//TODO represents a bug to fix
     assertRedirect(request, targetBaseUri+"/dummy?a=b", sourceBaseUri+"/dummy?a=b");
+    // %-encoded Redirects must be rewritten
+    assertRedirect(request, targetBaseUri+"/sample%20url", sourceBaseUri+"/sample%20url");
+    assertRedirect(request, targetBaseUri+"/sample%20url?a=b", sourceBaseUri+"/sample%20url?a=b");
+    assertRedirect(request, targetBaseUri+"/sample%20url?a=b#frag", sourceBaseUri+"/sample%20url?a=b#frag");
+    assertRedirect(request, targetBaseUri+"/sample+url", sourceBaseUri+"/sample+url");
+    assertRedirect(request, targetBaseUri+"/sample+url?a=b", sourceBaseUri+"/sample+url?a=b");
+    assertRedirect(request, targetBaseUri+"/sample+url?a=b#frag", sourceBaseUri+"/sample+url?a=b#frag");
+    assertRedirect(request, targetBaseUri+"/sample+url?a+b=b%20c#frag%23", sourceBaseUri+"/sample+url?a+b=b%20c#frag%23");
+    // Absolute redirects to 3rd parties must pass-through unchanged
+    assertRedirect(request, "http://blackhole.org/dir/file.ext?a=b#c", "http://blackhole.org/dir/file.ext?a=b#c");
   }
 
   private void assertRedirect(GetMethodWebRequest request, String origRedirect, String resultRedirect) throws IOException, SAXException {
     request.setHeaderField("xxTarget", origRedirect);
-    WebResponse rsp = sc.getResponse( request );
+    WebResponse rsp = sc.getResponse(request);
 
     assertEquals(HttpStatus.SC_MOVED_TEMPORARILY,rsp.getResponseCode());
     assertEquals("",rsp.getText());
     String gotLocation = rsp.getHeaderField(HttpHeaders.LOCATION);
     assertEquals(resultRedirect, gotLocation);
+    assertEquals("!Proxy!"+servletName+"JSESSIONID=1234;path="+servletPath,rsp.getHeaderField("Set-Cookie"));
   }
 
   @Test
@@ -220,7 +235,7 @@ public class ProxyServletTest
     final String HEADER = "Set-Cookie";
     localTestServer.register("/targetPath*", new RequestInfoHandler() {
       public void handle(HttpRequest request, HttpResponse response, HttpContext context) throws HttpException, IOException {
-        response.setHeader(HEADER, "JSESSIONID=1234; Path=/proxy/path/that/we/dont/want; Expires=Wed, 13 Jan 2021 22:23:01 GMT; Domain=.foo.bar.com; Secure");
+        response.setHeader(HEADER, "JSESSIONID=1234; Path=/proxy/path/that/we/dont/want; Expires=Wed, 13 Jan 2021 22:23:01 GMT; Domain=.foo.bar.com; HttpOnly");
         super.handle(request, response, context);
       }
     });
@@ -246,6 +261,22 @@ public class ProxyServletTest
     // note httpunit doesn't set all cookie fields, ignores max-agent, secure, etc.
     // also doesn't support more than one header of same name so I can't test this working on two cookies
     assertEquals("!Proxy!" + servletName + "JSESSIONID=1234;path=" + servletPath, rsp.getHeaderField("Set-Cookie"));
+  }
+
+  @Test
+  public void testSetCookieHttpOnly() throws Exception { //See GH #50
+    final String HEADER = "Set-Cookie";
+    localTestServer.register("/targetPath*", new RequestInfoHandler() {
+      public void handle(HttpRequest request, HttpResponse response, HttpContext context) throws HttpException, IOException {
+        response.setHeader(HEADER, "JSESSIONID=1234; Path=/proxy/path/that/we/dont/want/; HttpOnly");
+        super.handle(request, response, context);
+      }
+    });
+
+    GetMethodWebRequest req = makeGetMethodRequest(sourceBaseUri);
+    WebResponse rsp = execAndAssert(req, "");
+    // note httpunit doesn't set all cookie fields, ignores max-agent, secure, etc.
+    assertEquals("!Proxy!" + servletName + "JSESSIONID=1234;path=" + servletPath, rsp.getHeaderField(HEADER));
   }
 
   @Test
@@ -304,6 +335,33 @@ public class ProxyServletTest
     assertEquals("USER_2_SESSION", sc.getCookieJar().getCookie("!Proxy!" + servletName + "JSESSIONID").getValue());
   }
 
+  @Test
+  public void testRedirectWithBody() throws Exception {
+    final String CONTENT = "-This-Shall-Not-Pass-";
+	localTestServer.register("/targetPath/test",new HttpRequestHandler()
+    {
+      public void handle(HttpRequest request, HttpResponse response, HttpContext context) throws HttpException, IOException {
+        // Redirect to the requested URL with / appended
+        response.setHeader(HttpHeaders.LOCATION, targetBaseUri + "/test/");
+        response.setStatusCode(HttpStatus.SC_MOVED_TEMPORARILY);
+        response.setHeader(HttpHeaders.CONTENT_TYPE, "text/plain; charset=UTF-8");
+        // Set body of the response. We need it not-empty for the test.
+        response.setEntity(new ByteArrayEntity(CONTENT.getBytes("UTF-8")));
+      }
+    });
+    GetMethodWebRequest req = makeGetMethodRequest(sourceBaseUri + "/test");
+    // We expect a redirect with a / at the end
+    WebResponse rsp = sc.getResponse(req);
+
+    // Expect the same status code as the handler.
+    assertEquals(HttpStatus.SC_MOVED_TEMPORARILY, rsp.getResponseCode());
+    // Expect exact Content-Length
+    assertEquals(String.valueOf(CONTENT.length()), rsp.getHeaderField(HttpHeaders.CONTENT_LENGTH));
+    // Expect exact response
+    assertEquals(CONTENT, rsp.getText());
+    assertEquals(sourceBaseUri + "/test/", rsp.getHeaderField(HttpHeaders.LOCATION));
+  }
+
   private WebResponse execAssert(GetMethodWebRequest request, String expectedUri) throws Exception {
     return execAndAssert(request, expectedUri);
   }
@@ -337,6 +395,14 @@ public class ProxyServletTest
     String firstTextLine = text.substring(0,text.indexOf(System.getProperty("line.separator")));
 
     assertEquals(expectedFirstLine, firstTextLine);
+
+    // Assert all headers are present, and therefore checks the case has been preserved (see GH #65)
+    Dictionary headers = request.getHeaders();
+    Enumeration headerNameEnum = headers.keys();
+    while (headerNameEnum.hasMoreElements()) {
+      String headerName = (String) headerNameEnum.nextElement();
+      assertTrue(text.contains(headerName));
+    }
 
     return rsp;
   }

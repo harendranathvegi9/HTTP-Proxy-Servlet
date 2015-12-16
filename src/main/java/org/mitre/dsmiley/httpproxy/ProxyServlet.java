@@ -141,6 +141,7 @@ public class ProxyServlet extends HttpServlet {
 
     HttpParams hcParams = new BasicHttpParams();
     hcParams.setParameter(ClientPNames.COOKIE_POLICY, CookiePolicy.IGNORE_COOKIES);
+    hcParams.setBooleanParameter(ClientPNames.HANDLE_REDIRECTS, false); // See #70
     readConfigParam(hcParams, ClientPNames.HANDLE_REDIRECTS, Boolean.class);
     proxyClient = createHttpClient(hcParams);
   }
@@ -246,13 +247,10 @@ public class ProxyServlet extends HttpServlet {
     //spec: RFC 2616, sec 4.3: either of these two headers signal that there is a message body.
     if (servletRequest.getHeader(HttpHeaders.CONTENT_LENGTH) != null ||
         servletRequest.getHeader(HttpHeaders.TRANSFER_ENCODING) != null) {
-      HttpEntityEnclosingRequest eProxyRequest = new BasicHttpEntityEnclosingRequest(method, proxyRequestUri);
-      // Add the input entity (streamed)
-      //  note: we don't bother ensuring we close the servletInputStream since the container handles it
-      eProxyRequest.setEntity(new InputStreamEntity(servletRequest.getInputStream(), servletRequest.getContentLength()));
-      proxyRequest = eProxyRequest;
-    } else
+      proxyRequest = newProxyRequestWithEntity(method, proxyRequestUri, servletRequest);
+    } else {
       proxyRequest = new BasicHttpRequest(method, proxyRequestUri);
+    }
 
     copyRequestHeaders(servletRequest, proxyRequest);
 
@@ -266,24 +264,28 @@ public class ProxyServlet extends HttpServlet {
       }
       proxyResponse = proxyClient.execute(getTargetHost(servletRequest), proxyRequest);
 
-      // Process the response
+      // Process the response:
+
+      // Pass the response code. This method with the "reason phrase" is deprecated but it's the
+      //   only way to pass the reason along too.
       int statusCode = proxyResponse.getStatusLine().getStatusCode();
-
-      if (doResponseRedirectOrNotModifiedLogic(servletRequest, servletResponse, proxyResponse, statusCode)) {
-        //the response is already "committed" now without any body to send
-        //TODO copy response headers?
-        return;
-      }
-
-      // Pass the response code. This method with the "reason phrase" is deprecated but it's the only way to pass the
-      //  reason along too.
       //noinspection deprecation
       servletResponse.setStatus(statusCode, proxyResponse.getStatusLine().getReasonPhrase());
 
+      // Copying response headers to make sure SESSIONID or other Cookie which comes from the remote
+      // server will be saved in client when the proxied url was redirected to another one.
+      // See issue [#51](https://github.com/mitre/HTTP-Proxy-Servlet/issues/51)
       copyResponseHeaders(proxyResponse, servletRequest, servletResponse);
 
-      // Send the content to the client
-      copyResponseEntity(proxyResponse, servletResponse);
+      if (statusCode == HttpServletResponse.SC_NOT_MODIFIED) {
+        // 304 needs special handling.  See:
+        // http://www.ics.uci.edu/pub/ietf/http/rfc1945.html#Code304
+        // Don't send body entity/content!
+        servletResponse.setIntHeader(HttpHeaders.CONTENT_LENGTH, 0);
+      } else {
+        // Send the content to the client
+        copyResponseEntity(proxyResponse, servletResponse, proxyRequest, servletRequest);
+      }
 
     } catch (Exception e) {
       //abort request, according to best practice with HttpClient
@@ -309,37 +311,16 @@ public class ProxyServlet extends HttpServlet {
     }
   }
 
-  protected boolean doResponseRedirectOrNotModifiedLogic(
-          HttpServletRequest servletRequest, HttpServletResponse servletResponse,
-          HttpResponse proxyResponse, int statusCode)
-          throws ServletException, IOException {
-    // Check if the proxy response is a redirect
-    // The following code is adapted from org.tigris.noodle.filters.CheckForRedirect
-    if (statusCode >= HttpServletResponse.SC_MULTIPLE_CHOICES /* 300 */
-        && statusCode < HttpServletResponse.SC_NOT_MODIFIED /* 304 */) {
-      Header locationHeader = proxyResponse.getLastHeader(HttpHeaders.LOCATION);
-      if (locationHeader == null) {
-        throw new ServletException("Received status code: " + statusCode
-            + " but no " + HttpHeaders.LOCATION + " header was found in the response");
-      }
-      // Modify the redirect to go to this proxy servlet rather that the proxied host
-      String locStr = rewriteUrlFromResponse(servletRequest, locationHeader.getValue());
-
-      servletResponse.sendRedirect(locStr);
-      return true;
-    }
-    // 304 needs special handling.  See:
-    // http://www.ics.uci.edu/pub/ietf/http/rfc1945.html#Code304
-    // We get a 304 whenever passed an 'If-Modified-Since'
-    // header and the data on disk has not changed; server
-    // responds w/ a 304 saying I'm not going to send the
-    // body because the file has not changed.
-    if (statusCode == HttpServletResponse.SC_NOT_MODIFIED) {
-      servletResponse.setIntHeader(HttpHeaders.CONTENT_LENGTH, 0);
-      servletResponse.setStatus(HttpServletResponse.SC_NOT_MODIFIED);
-      return true;
-    }
-    return false;
+  private HttpRequest newProxyRequestWithEntity(String method, String proxyRequestUri,
+                                                HttpServletRequest servletRequest)
+          throws IOException {
+    HttpEntityEnclosingRequest eProxyRequest =
+            new BasicHttpEntityEnclosingRequest(method, proxyRequestUri);
+    // Add the input entity (streamed)
+    //  note: we don't bother ensuring we close the servletInputStream since the container handles it
+    eProxyRequest.setEntity(
+            new InputStreamEntity(servletRequest.getInputStream(), servletRequest.getContentLength()));
+    return eProxyRequest;
   }
 
   protected void closeQuietly(Closeable closeable) {
@@ -409,8 +390,8 @@ public class ProxyServlet extends HttpServlet {
 
   private void setXForwardedForHeader(HttpServletRequest servletRequest,
                                       HttpRequest proxyRequest) {
-    String headerName = "X-Forwarded-For";
     if (doForwardIP) {
+      String headerName = "X-Forwarded-For";
       String newHeader = servletRequest.getRemoteAddr();
       String existingHeader = servletRequest.getHeader(headerName);
       if (existingHeader != null) {
@@ -426,9 +407,12 @@ public class ProxyServlet extends HttpServlet {
     for (Header header : proxyResponse.getAllHeaders()) {
       if (hopByHopHeaders.containsHeader(header.getName()))
         continue;
-      if (header.getName().equals(org.apache.http.cookie.SM.SET_COOKIE) ||
-          header.getName().equals(org.apache.http.cookie.SM.SET_COOKIE2)) {
+      if (header.getName().equalsIgnoreCase(org.apache.http.cookie.SM.SET_COOKIE) ||
+          header.getName().equalsIgnoreCase(org.apache.http.cookie.SM.SET_COOKIE2)) {
         copyProxyCookie(servletRequest, servletResponse, header);
+      } else if (header.getName().equalsIgnoreCase(HttpHeaders.LOCATION)) {
+        // LOCATION Header may have to be rewritten.
+        servletResponse.addHeader(header.getName(), rewriteUrlFromResponse(servletRequest, header.getValue()));
       } else {
         servletResponse.addHeader(header.getName(), header.getValue());
       }
@@ -441,11 +425,8 @@ public class ProxyServlet extends HttpServlet {
   protected void copyProxyCookie(HttpServletRequest servletRequest,
                                  HttpServletResponse servletResponse, Header header) {
     List<HttpCookie> cookies = HttpCookie.parse(header.getValue());
-    String path = getServletContext().getServletContextName();
-    if (path == null) {
-        path = "";
-    }
-    path += servletRequest.getServletPath();
+    String path = servletRequest.getContextPath(); // path starts with / or is empty string
+    path += servletRequest.getServletPath(); // servlet path starts with / or is empty string
 
     for (HttpCookie cookie : cookies) {
       //set cookie name prefixed w/ a proxy value so it won't collide w/ other cookies
@@ -492,7 +473,9 @@ public class ProxyServlet extends HttpServlet {
   }
 
   /** Copy response body data (the entity) from the proxy to the servlet client. */
-  protected void copyResponseEntity(HttpResponse proxyResponse, HttpServletResponse servletResponse) throws IOException {
+  protected void copyResponseEntity(HttpResponse proxyResponse, HttpServletResponse servletResponse,
+                                    HttpRequest proxyRequest, HttpServletRequest servletRequest)
+          throws IOException {
     HttpEntity entity = proxyResponse.getEntity();
     if (entity != null) {
       OutputStream servletOutputStream = servletResponse.getOutputStream();
@@ -545,13 +528,32 @@ public class ProxyServlet extends HttpServlet {
     //TODO document example paths
     final String targetUri = getTargetUri(servletRequest);
     if (theUrl.startsWith(targetUri)) {
-      String curUrl = servletRequest.getRequestURL().toString();//no query
-      String pathInfo = servletRequest.getPathInfo();
-      if (pathInfo != null) {
-        assert curUrl.endsWith(pathInfo);
-        curUrl = curUrl.substring(0,curUrl.length()-pathInfo.length());//take pathInfo off
+      /*-
+       * The URL points back to the back-end server.
+       * Instead of returning it verbatim we replace the target path with our
+       * source path in a way that should instruct the original client to
+       * request the URL pointed through this Proxy.
+       * We do this by taking the current request and rewriting the path part
+       * using this servlet's absolute path and the path from the returned URL
+       * after the base target URL.
+       */
+      StringBuffer curUrl = servletRequest.getRequestURL();//no query
+      int pos;
+      // Skip the protocol part
+      if ((pos = curUrl.indexOf("://"))>=0) {
+        // Skip the authority part
+        // + 3 to skip the separator between protocol and authority
+        if ((pos = curUrl.indexOf("/", pos + 3)) >=0) {
+          // Trim everything after the authority part.
+          curUrl.setLength(pos);
+        }
       }
-      theUrl = curUrl+theUrl.substring(targetUri.length());
+      // Context path starts with a / if it is not blank
+      curUrl.append(servletRequest.getContextPath());
+      // Servlet path starts with a / if it is not blank
+      curUrl.append(servletRequest.getServletPath());
+      curUrl.append(theUrl, targetUri.length(), theUrl.length());
+      theUrl = curUrl.toString();
     }
     return theUrl;
   }
